@@ -11,7 +11,7 @@ mod translate;
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
@@ -208,15 +208,18 @@ fn show_config() -> Result<()> {
 }
 
 /// Paths given on the command line, or the configured game + test titles.
-pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
-    if !paths.is_empty() {
-        return Ok(paths);
+pub(crate) fn default_paths(mut paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
+    if paths.is_empty() {
+        let cfg = victory_core::Config::load()?;
+        paths.extend(cfg.game_dir.into_iter().chain(cfg.test_titles));
+        anyhow::ensure!(
+            !paths.is_empty(),
+            "no paths given and none configured (see victory.example.toml)"
+        );
     }
-    let cfg = victory_core::Config::load()?;
-    let all: Vec<PathBuf> = cfg.game_dir.into_iter().chain(cfg.test_titles).collect();
-    anyhow::ensure!(
-        !all.is_empty(),
-        "no paths given and none configured (see victory.example.toml)"
-    );
-    Ok(all)
+    for path in &paths {
+        std::fs::metadata(path)
+            .with_context(|| format!("checking scan input {}", path.display()))?;
+    }
+    Ok(paths)
 }
