@@ -364,12 +364,40 @@ struct Slice {
     index: usize,
 }
 
+impl Slice {
+    fn key(&self, page: usize) -> (usize, usize) {
+        (Arc::as_ptr(&self.section) as usize, self.index + page)
+    }
+
+    /// The decoder writes through a private view of the section. Report those bytes
+    /// at every address where the title can now see them, including views mapped
+    /// while the decoder was working. Mappings stay fixed until publication ends.
+    fn written_views(&self, offset: usize, len: usize, mut notify: impl FnMut(usize, usize)) {
+        if len == 0 {
+            return;
+        }
+        let physical = physical();
+        let end = offset + len;
+        for k in offset / PAGE..end.div_ceil(PAGE) {
+            if let Some(views) = physical.shown.get(&self.key(k)) {
+                let start = offset.saturating_sub(k * PAGE);
+                let bytes = (end - k * PAGE).min(PAGE) - start;
+                for &base in views {
+                    notify(base + start, bytes);
+                }
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct Physical {
     next_page: usize,
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
+    /// Title addresses of each physical page, keyed by section and page index.
+    shown: HashMap<(usize, usize), Vec<usize>>,
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -558,6 +586,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         };
         let k = (n * PAGE - within).min(data.len() - done);
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+        slice.written_views(within, k, victory_gpu::kernel_will_write);
         (within, done) = (0, done + k);
     }
     true
@@ -568,8 +597,16 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
 /// would then copy.
 pub(crate) struct PageWindow {
     view: View,
+    slice: Slice,
     within: usize,
     len: usize,
+}
+
+impl Drop for PageWindow {
+    fn drop(&mut self) {
+        // A decoder can return an error after writing part of its destination.
+        self.slice.written_views(self.within, self.len, victory_gpu::kernel_will_write);
+    }
 }
 
 impl PageWindow {
@@ -591,6 +628,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     };
     Some(PageWindow {
         view: View::map(slice, *n)?,
+        slice: slice.clone(),
         within: offset % PAGE,
         len,
     })
@@ -746,6 +784,9 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
     victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    for k in 0..len / PAGE {
+        physical.shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
+    }
     physical.views.insert(base, (len, slice));
     true
 }
@@ -824,6 +865,15 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
+        for k in 0..size / PAGE {
+            let key = slice.key(k);
+            if let Some(addresses) = physical.shown.get_mut(&key) {
+                addresses.retain(|&a| a != at + k * PAGE);
+                if addresses.is_empty() {
+                    physical.shown.remove(&key);
+                }
+            }
+        }
         victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
@@ -1070,6 +1120,48 @@ mod tests {
             assert!(report.contains("Windows paging file size"));
         }
         assert!(!fallback.contains("System commit:"));
+    }
+
+    #[test]
+    fn a_streaming_window_reports_current_views_of_only_the_written_pages() {
+        let mut pages = [0usize; 3];
+        let mut n = pages.len();
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let reserve = || XMemVirtualAlloc(std::ptr::null_mut(), 3 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        let (a, b) = (reserve(), reserve());
+        assert!(!a.is_null() && !b.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
+        let mut window = page_window(&pages, PAGE - 1, 3).unwrap();
+        // Replace a's middle page while decoding and map the original page twice elsewhere.
+        let middle = a.wrapping_byte_add(PAGE);
+        assert_eq!(XMemMapPhysicalPages(middle, 1, pages[2..].as_ptr()), middle);
+        let b2 = b.wrapping_byte_add(2 * PAGE);
+        for alias in [b, b2] {
+            assert_eq!(XMemMapPhysicalPages(alias, 1, pages[1..].as_ptr()), alias);
+        }
+        window.bytes().copy_from_slice(&[7, 8, 9]);
+        let mut reported = Vec::new();
+        window.slice.written_views(window.within, window.len, |at, bytes| reported.push((at, bytes)));
+        let mut expected = [(a as usize + PAGE - 1, 1), (b as usize, 2), (b2 as usize, 2)];
+        reported.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(reported, expected);
+        drop(window);
+        // SAFETY: both views still show the written page; the replaced page is separate.
+        unsafe {
+            assert_eq!(b.cast::<u8>().read(), 8);
+            assert_eq!(b2.cast::<u8>().add(1).read(), 9);
+            assert_eq!(middle.cast::<u8>().read(), 0);
+        }
+        for base in [a, b] {
+            assert_eq!(XMemMapPhysicalPages(base, 3, std::ptr::null()), base);
+            // Each 64 KiB page was split into its own placeholder above.
+            for k in 0..3 {
+                // SAFETY: the unmapped placeholder at this address is ours.
+                assert_ne!(unsafe { VirtualFree(base.wrapping_byte_add(k * PAGE), 0, MEM_RELEASE) }, 0);
+            }
+        }
+        assert_eq!(XMemFreePhysicalPages(n, pages.as_ptr()), 1);
     }
 
     #[test]
