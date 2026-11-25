@@ -343,6 +343,21 @@ fn bench_indirect_draw_barriers() {
                 .unwrap();
             heap.unwrap()
         };
+        // Check the warm-up of each mode for dropped draws. Keep pipeline
+        // statistics queries out of the frames used for timing.
+        let mut statistics = None;
+        device
+            .CreateQueryHeap(
+                &D3D12_QUERY_HEAP_DESC {
+                    Type: D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS,
+                    Count: 1,
+                    NodeMask: 0,
+                },
+                &mut statistics,
+            )
+            .unwrap();
+        let statistics: ID3D12QueryHeap = statistics.unwrap();
+        const STATS_OFFSET: u64 = 16; // after the two timestamps
         let mut back: Option<ID3D12Resource> = None;
         device
             .CreateCommittedResource(
@@ -353,7 +368,7 @@ fn bench_indirect_draw_barriers() {
                 D3D12_HEAP_FLAG_NONE,
                 &D3D12_RESOURCE_DESC {
                     Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                    Width: 16,
+                    Width: STATS_OFFSET + size_of::<D3D12_QUERY_DATA_PIPELINE_STATISTICS>() as u64,
                     Height: 1,
                     DepthOrArraySize: 1,
                     MipLevels: 1,
@@ -374,7 +389,12 @@ fn bench_indirect_draw_barriers() {
 
         // One frame's lists: GPU ms (timestamps around the list), CPU ms
         // recording it, ms from submission to the end of its run.
-        let mut frame = |barriers: Barriers, clamp: &Clamp, window: u32, card: bool| -> [f64; 3] {
+        let mut frame = |barriers: Barriers,
+                         clamp: &Clamp,
+                         window: u32,
+                         card: bool,
+                         check_draws: bool|
+         -> [f64; 3] {
             allocator.Reset().unwrap();
             list.Reset(&allocator, None).unwrap();
             let recording = std::time::Instant::now();
@@ -396,6 +416,9 @@ fn bench_indirect_draw_barriers() {
                 windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             );
             list.SetGraphicsRootSignature(&root);
+            if check_draws {
+                list.BeginQuery(&statistics, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+            }
             let mut state = D3D12_RESOURCE_STATE_COMMON;
             for first in (0..DRAWS).step_by(window as usize) {
                 let records = window.min(DRAWS - first);
@@ -427,6 +450,17 @@ fn bench_indirect_draw_barriers() {
                 list.ResourceBarrier(&[transition(&scratch, state, D3D12_RESOURCE_STATE_COMMON)]);
             }
             list.EndQuery(&stamps, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+            if check_draws {
+                list.EndQuery(&statistics, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+                list.ResolveQueryData(
+                    &statistics,
+                    D3D12_QUERY_TYPE_PIPELINE_STATISTICS,
+                    0,
+                    1,
+                    &back,
+                    STATS_OFFSET,
+                );
+            }
             list.ResolveQueryData(&stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &back, 0);
             list.Close().unwrap();
             let recorded = recording.elapsed().as_secs_f64() * 1e3;
@@ -441,6 +475,16 @@ fn bench_indirect_draw_barriers() {
             back.Map(0, None, Some(&mut data)).unwrap();
             let t = std::slice::from_raw_parts(data.cast::<u64>(), 2);
             let gpu = t[1].saturating_sub(t[0]) as f64 / frequency * 1e3;
+            if check_draws {
+                let stats = &*data
+                    .byte_add(STATS_OFFSET as usize)
+                    .cast::<D3D12_QUERY_DATA_PIPELINE_STATISTICS>();
+                assert_eq!(
+                    stats.IAPrimitives,
+                    u64::from(DRAWS),
+                    "one triangle per indirect draw"
+                );
+            }
             back.Unmap(0, None);
             (budget_ptr as *mut u32).write_volatile(0);
             [gpu, recorded, ran]
@@ -462,12 +506,12 @@ fn bench_indirect_draw_barriers() {
         ];
         // Warm up, then the cases in turn, so drift falls on all alike.
         for &(_, barriers, clamp, window, card) in &cases {
-            frame(barriers, clamp, window, card);
+            frame(barriers, clamp, window, card, true);
         }
         let mut times: Vec<Vec<[f64; 3]>> = vec![Vec::new(); cases.len()];
         for _ in 0..RUNS {
             for (i, &(_, barriers, clamp, window, card)) in cases.iter().enumerate() {
-                times[i].push(frame(barriers, clamp, window, card));
+                times[i].push(frame(barriers, clamp, window, card, false));
             }
         }
         let median = |v: &[[f64; 3]], k: usize| {
